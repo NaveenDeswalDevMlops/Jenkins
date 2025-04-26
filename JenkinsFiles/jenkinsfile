@@ -1,0 +1,191 @@
+pipeline {
+    agent {
+        label 'cicd'
+    }
+
+    environment {
+        S3_BUCKET = 'Your-bucket-name'
+        AWS_REGION = 'ap-southeast-2'
+        EC2_INSTANCE_ID = 'i-0xxxxxxxxx'
+        GITHUB_REPO_PATH = '/path/to/your/local/github/repo' // Replace with actual path
+        IAM_ROLE = 'arn:aws:iam::accont:role/CrossAccountRole'
+    }
+
+    parameters {
+        string(name: 'RELEASE_TAG', defaultValue: '', description: 'Enter GitHub release tag to deploy')
+    }
+
+    stages {
+        stage('Checkout Local GitHub Repo') {
+            steps {
+                script {
+                    sh '''
+                        cd $GITHUB_REPO_PATH
+                        git fetch --tags
+                        git checkout $RELEASE_TAG
+                        echo "Checked out release tag: $RELEASE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Prepare API Folder') {
+            steps {
+                script {
+                    sh '''
+                        cd $GITHUB_REPO_PATH
+                        rm -rf API
+                        mkdir API
+                        cp -r * API/
+                        ls -l API
+                    '''
+                }
+            }
+        }
+
+        stage('Timestamp Folder') {
+            steps {
+                script {
+                    def timestamp = new Date().format("yyyyMMdd_HHmmss")
+                    env.FOLDER_NAME = "App_Engg_${timestamp}".trim()
+                    echo "Folder name: ${env.FOLDER_NAME}"
+                }
+            }
+        }
+
+        stage('Upload to S3') {
+            steps {
+                script {
+                    withAWS(role: "${IAM_ROLE}", useNode: true) {
+                        sh """
+                            aws s3 cp API s3://${S3_BUCKET}/API/${env.FOLDER_NAME}/ --recursive
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Approval') {
+            steps {
+                input message: 'Proceed with deployment?',
+                      parameters: [
+                        booleanParam(name: 'Proceed', defaultValue: true),
+                        string(name: 'Approval_Comments', description: 'Comments')
+                      ]
+            }
+        }
+
+        stage('Deploy to EC2 via SSM') {
+            steps {
+                script {
+                    withAWS(role: "${IAM_ROLE}", useNode: true) {
+                        sh """
+                            aws ssm send-command \
+                                --document-name "AWS-RunShellScript" \
+                                --instance-ids "${EC2_INSTANCE_ID}" \
+                                --comment "Deploying release" \
+                                --parameters 'commands=["aws s3 cp s3://${S3_BUCKET}/API/${env.FOLDER_NAME}/ /home/ubuntu/AppEngg/API --recursive"]' \
+                                --region ${AWS_REGION}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Install VENV Packages') {
+            steps {
+                script {
+                    withAWS(role: "${IAM_ROLE}", useNode: true) {
+                        def commandId = sh(
+                            script: """
+                                aws ssm send-command \
+                                    --document-name "AWS-RunShellScript" \
+                                    --instance-ids "${EC2_INSTANCE_ID}" \
+                                    --comment "Install Python packages" \
+                                    --parameters 'commands=["bash -c \"source /home/ubuntu/AppEngg/venv/bin/activate && python -m ensurepip && pip install -r /home/ubuntu/AppEngg/API/requirements.txt\""]' \
+                                    --region ${AWS_REGION} \
+                                    --query "Command.CommandId" \
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        echo "SSM Command ID: ${commandId}"
+                        sleep(120)
+
+                        sh """
+                            aws ssm list-command-invocations \
+                                --command-id "${commandId}" \
+                                --details \
+                                --region ${AWS_REGION}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Restart Services') {
+            steps {
+                script {
+                    withAWS(role: "${IAM_ROLE}", useNode: true) {
+                        sh """
+                            aws ssm send-command \
+                                --document-name "AWS-RunShellScript" \
+                                --instance-ids "${EC2_INSTANCE_ID}" \
+                                --comment "Restarting services" \
+                                --parameters 'commands=["sudo systemctl restart ReadWrite-api.service", "sudo systemctl restart exceptionAPI.service", "sudo systemctl restart nginx.service"]' \
+                                --region ${AWS_REGION}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('SNS Notification') {
+            steps {
+                script {
+                    withAWS(role: "${IAM_ROLE}", useNode: true) {
+                        sh """
+                            aws sns publish \
+                                --topic-arn arn:aws:sns:${AWS_REGION}:account:Dev-Monitoring-Alerts \
+                                --message "Deployment completed for ${env.FOLDER_NAME}" \
+                                --subject "Deployment Notification" \
+                                --region ${AWS_REGION}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Rollback/Proceed') {
+            steps {
+                script {
+                    def rollbackFolder = input message: 'Enter rollback folder name:',
+                        parameters: [string(name: 'Rollback_Folder', defaultValue: '', description: 'S3 folder for rollback')]
+
+                    if (rollbackFolder) {
+                        echo "Rolling back to: ${rollbackFolder}"
+                        withAWS(role: "${IAM_ROLE}", useNode: true) {
+                            sh """
+                                aws ssm send-command \
+                                    --document-name "AWS-RunShellScript" \
+                                    --instance-ids "${EC2_INSTANCE_ID}" \
+                                    --comment "Rollback" \
+                                    --parameters 'commands=["aws s3 cp s3://${S3_BUCKET}/API/${rollbackFolder}/ /home/ubuntu/AppEngg/API --recursive"]' \
+                                    --region ${AWS_REGION}
+
+                                aws sns publish \
+                                    --topic-arn arn:aws:sns:${AWS_REGION}:xxxx:Dev-Monitoring-Alerts \
+                                    --message "Rollback to folder ${rollbackFolder} initiated." \
+                                    --subject "Rollback Notification" \
+                                    --region ${AWS_REGION}
+                            """
+                        }
+                    } else {
+                        echo "No rollback folder provided."
+                    }
+                }
+            }
+        }
+    }
+}
